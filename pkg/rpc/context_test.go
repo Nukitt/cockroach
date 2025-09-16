@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/grpcutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/rpcutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/circuit"
@@ -2271,11 +2271,11 @@ func BenchmarkGRPCPing(b *testing.B) {
 			require.NoError(b, err)
 			b.Logf("marshaled request size: %d bytes (%d bytes of overhead)", req.Size(), req.Size()-bytes)
 
-			tsi := &grpcutils.TestServerImpl{
+			tsi := &rpcutils.TestServerImpl{
 				UU: func(ctx context.Context, req *types.Any) (*types.Any, error) {
 					return anyresp, nil
 				},
-				SS: func(srv grpcutils.GRPCTest_StreamStreamServer) error {
+				SS: func(srv rpcutils.GRPCTest_StreamStreamServer) error {
 					for {
 						if _, err := srv.Recv(); err != nil {
 							return err
@@ -2287,7 +2287,7 @@ func BenchmarkGRPCPing(b *testing.B) {
 				},
 			}
 
-			grpcutils.RegisterGRPCTestServer(s, tsi)
+			rpcutils.RegisterGRPCTestServer(s, tsi)
 
 			ln, err := netutil.ListenAndServeGRPC(srvRPCCtx.Stopper, s, util.TestAddr)
 			if err != nil {
@@ -2302,9 +2302,9 @@ func BenchmarkGRPCPing(b *testing.B) {
 
 			for _, tc := range []struct {
 				name   string
-				invoke func(c grpcutils.GRPCTestClient, N int) error
+				invoke func(c rpcutils.TestClient, N int) error
 			}{
-				{"UnaryUnary", func(c grpcutils.GRPCTestClient, N int) error {
+				{"UnaryUnary", func(c rpcutils.TestClient, N int) error {
 					for i := 0; i < N; i++ {
 						_, err := c.UnaryUnary(ctx, anyreq)
 						if err != nil {
@@ -2314,7 +2314,7 @@ func BenchmarkGRPCPing(b *testing.B) {
 					return nil
 				}},
 				{
-					"StreamStream", func(c grpcutils.GRPCTestClient, N int) error {
+					"StreamStream", func(c rpcutils.TestClient, N int) error {
 						sc, err := c.StreamStream(ctx)
 						if err != nil {
 							return err
@@ -2333,7 +2333,7 @@ func BenchmarkGRPCPing(b *testing.B) {
 
 				b.Run("rpc="+tc.name, func(b *testing.B) {
 
-					c := grpcutils.NewGRPCTestClient(cc)
+					c := rpcutils.NewTestClient(cc)
 
 					b.SetBytes(int64(req.Size() + resp.Size()))
 					b.ResetTimer()

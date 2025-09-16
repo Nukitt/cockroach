@@ -26,6 +26,7 @@ go_test(
     deps = [
         ":drpcinterceptor",
         "//pkg/testutils",
+        "//pkg/testutils/rpcutils",
         "//pkg/util",
         "//pkg/util/leaktest",
         "//pkg/util/protoutil",

@@ -56,6 +56,7 @@ func RegisterTests(r registry.Registry) {
 	registerDiskStalledWALFailover(r)
 	registerDiskStalledWALFailoverWithProgress(r)
 	registerDjango(r)
+	registerDRPC(r)
 	registerDrain(r)
 	registerDrop(r)
 	registerEncryption(r)

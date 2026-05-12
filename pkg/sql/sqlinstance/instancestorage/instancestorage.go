@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/regions"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -253,6 +254,40 @@ func (s *Storage) ReleaseInstance(
 	})
 }
 
+// waitForActiveSession retries until the session's expiration is ahead of the
+// current clock time, or the context is canceled. The sqlliveness heartbeat
+// loop (server.sqlliveness.heartbeat) extends the session atomically, so the
+// typical wait is under one heartbeat period.
+func (s *Storage) waitForActiveSession(ctx context.Context, session sqlliveness.Session) error {
+	now := s.clock.Now()
+	if now.Less(session.Expiration()) {
+		return nil
+	}
+	log.Dev.Infof(ctx,
+		"session %s expiration %s is behind current time %s, waiting for heartbeat to extend it",
+		session.ID(), session.Expiration(), now)
+	maxWait := 2 * slbase.DefaultHeartBeat.Get(&s.settings.SV)
+	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+	opts := retry.Options{
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     1 * time.Second,
+		Multiplier:     2,
+	}
+	for r := retry.StartWithCtx(waitCtx, opts); r.Next(); {
+		if s.clock.Now().Less(session.Expiration()) {
+			return nil
+		}
+	}
+	if ctx.Err() != nil {
+		return errors.Wrap(ctx.Err(), "waiting for active session")
+	}
+	return errors.Newf(
+		"session %s expiration %s did not advance past current time %s; session may have expired",
+		session.ID(), session.Expiration(), s.clock.Now(),
+	)
+}
+
 func (s *Storage) createInstanceRow(
 	ctx context.Context,
 	session sqlliveness.Session,
@@ -274,10 +309,16 @@ func (s *Storage) createInstanceRow(
 		return sqlinstance.InstanceInfo{}, errors.Wrap(err, "unable to determine region for sql_instance")
 	}
 
-	// TODO(jeffswenson): advance session expiration. This can get stuck in a
-	// loop if the session already expired.
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	assignInstance := func() (base.SQLInstanceID, error) {
+		// Wait for the session expiration to advance past the current clock
+		// time. Under heavy startup load, the session expiration set at
+		// creation can go stale before the heartbeat loop extends it. Without
+		// this check, UpdateDeadline would reject the stale expiration and
+		// crash server startup.
+		if err := s.waitForActiveSession(ctx, session); err != nil {
+			return base.SQLInstanceID(0), err
+		}
 		var availableID base.SQLInstanceID
 		if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			// Run the claim transaction as high priority to ensure that it does not

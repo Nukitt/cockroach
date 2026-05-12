@@ -17,17 +17,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/sqllivenesstestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -560,4 +563,155 @@ func claim(
 		/* encodeIsDraining */ true,
 		/* isDraining */ false,
 	))
+}
+
+func TestWaitForActiveSession(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	t.Run("expiration already valid", func(t *testing.T) {
+		clock := hlc.NewClockForTesting(nil)
+		s := &Storage{clock: clock, settings: cluster.MakeTestingClusterSettings()}
+		session := &sqllivenesstestutils.FakeSession{
+			SessionID: makeSession(),
+			ExpTS:     clock.Now().Add(time.Minute.Nanoseconds(), 0),
+		}
+
+		require.NoError(t, s.waitForActiveSession(ctx, session))
+	})
+
+	t.Run("stale expiration with canceled context", func(t *testing.T) {
+		clock := hlc.NewClockForTesting(nil)
+		s := &Storage{clock: clock, settings: cluster.MakeTestingClusterSettings()}
+		session := &sqllivenesstestutils.FakeSession{
+			SessionID: makeSession(),
+			ExpTS:     clock.Now().Add(-time.Second.Nanoseconds(), 0),
+		}
+
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		err := s.waitForActiveSession(canceledCtx, session)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "waiting for active session")
+	})
+
+	t.Run("stale expiration advanced by heartbeat", func(t *testing.T) {
+		clock := hlc.NewClockForTesting(nil)
+		st := cluster.MakeTestingClusterSettings()
+		s := &Storage{clock: clock, settings: st}
+
+		session := &concurrentFakeSession{
+			sessionID: makeSession(),
+			expTS:     clock.Now().Add(-time.Second.Nanoseconds(), 0),
+		}
+
+		// Simulate a heartbeat advancing the session expiration after a
+		// short delay.
+		time.AfterFunc(200*time.Millisecond, func() {
+			session.mu.Lock()
+			defer session.mu.Unlock()
+			session.expTS = clock.Now().Add(time.Minute.Nanoseconds(), 0)
+		})
+
+		require.NoError(t, s.waitForActiveSession(ctx, session))
+	})
+
+	t.Run("stale expiration not advanced times out", func(t *testing.T) {
+		clock := hlc.NewClockForTesting(nil)
+		st := cluster.MakeTestingClusterSettings()
+		s := &Storage{clock: clock, settings: st}
+		session := &sqllivenesstestutils.FakeSession{
+			SessionID: makeSession(),
+			ExpTS:     clock.Now().Add(-time.Second.Nanoseconds(), 0),
+		}
+
+		err := s.waitForActiveSession(ctx, session)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "did not advance past current time")
+	})
+}
+
+// concurrentFakeSession is a thread-safe implementation of sqlliveness.Session
+// that allows expiration to be updated from another goroutine.
+type concurrentFakeSession struct {
+	mu        syncutil.Mutex
+	sessionID sqlliveness.SessionID
+	expTS     hlc.Timestamp
+}
+
+var _ sqlliveness.Session = (*concurrentFakeSession)(nil)
+
+func (s *concurrentFakeSession) ID() sqlliveness.SessionID { return s.sessionID }
+
+func (s *concurrentFakeSession) Expiration() hlc.Timestamp {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.expTS
+}
+
+func (s *concurrentFakeSession) Start() hlc.Timestamp { return hlc.Timestamp{} }
+
+// TestCreateInstanceWithStaleSessionExpiration verifies that CreateInstance
+// succeeds when the session's expiration is initially behind the current clock
+// time, as long as it advances (via heartbeat) before the wait timeout. This
+// is the scenario from #135273: under heavy startup load the sqlliveness
+// session expiration can go stale before CreateInstance runs, causing
+// UpdateDeadline to reject the stale expiration with "deadline below read
+// timestamp is nonsensical".
+func TestCreateInstanceWithStaleSessionExpiration(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+
+	stopper, storage, slStorage, _ := setup(t, sqlDB, s)
+	defer stopper.Stop(ctx)
+
+	const preallocatedCount = 5
+	PreallocatedCount.Override(ctx, &s.ClusterSettings().SV, preallocatedCount)
+
+	// Preallocate instance rows.
+	sessionExpiry := s.Clock().Now().Add(time.Hour.Nanoseconds(), 0)
+	for i := base.SQLInstanceID(1); i <= preallocatedCount; i++ {
+		require.NoError(t, storage.CreateInstanceDataForTest(
+			ctx, enum.One, i, "", "", sqlliveness.SessionID([]byte{}),
+			sessionExpiry, roachpb.Locality{}, roachpb.Version{},
+			true /* encodeIsDraining */, false, /* isDraining */
+		))
+	}
+
+	// Create a session with an expiration behind the server's current clock
+	// time, simulating heavy startup where the session goes stale before
+	// CreateInstance runs.
+	sessionID := makeSession()
+	staleExpiry := s.Clock().Now().Add(-time.Second.Nanoseconds(), 0)
+	require.NoError(t, slStorage.Insert(ctx, sessionID, staleExpiry))
+
+	session := &concurrentFakeSession{
+		sessionID: sessionID,
+		expTS:     staleExpiry,
+	}
+
+	// Simulate the heartbeat loop extending the session after a short delay.
+	newExpiry := s.Clock().Now().Add(time.Minute.Nanoseconds(), 0)
+	time.AfterFunc(200*time.Millisecond, func() {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		session.expTS = newExpiry
+		_ = slStorage.Delete(ctx, sessionID)
+		_ = slStorage.Insert(ctx, sessionID, newExpiry)
+	})
+
+	instance, err := storage.CreateInstance(
+		ctx, session, "rpc-addr", "sql-addr",
+		roachpb.Locality{}, roachpb.Version{Major: 28},
+	)
+	require.NoError(t, err)
+	require.NotZero(t, instance.InstanceID)
 }
